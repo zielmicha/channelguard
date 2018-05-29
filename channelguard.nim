@@ -12,8 +12,8 @@ type
     myInput: Output[Buffer]
     myOutput: Input[Buffer]
 
-    peerPublic: C25519Public
-    myKey: C25519Private
+    peerPublic: Ed25519Public
+    myKey: Ed25519Private
     psk: Sha256Hash
 
     staticRxKey: array[32, byte]
@@ -33,7 +33,7 @@ proc isReady(self: Tunnel): bool =
   return self.ready.getFuture.isCompleted
 
 proc sendHandshake(self: Tunnel, h: Handshake) {.async.} =
-  let data = binaryPack(h)
+  let data = ed25519Sign(data=binaryPack(h), key=self.myKey, purpose="cg-handshake")
   let encrypted = newBuffer(1 + secretboxLength + data.len)
   encrypted[0] = 0
   secretboxMake(key=self.staticTxKey, plaintext=data, target=encrypted.slice(1))
@@ -70,9 +70,11 @@ proc finishExchange(self: Tunnel, peerEphemeral: C25519Public) =
   self.ready.complete
 
 proc receivedHandshake(self: Tunnel, data: Buffer) {.async.} =
-  let plaintext = secretboxOpen(key=self.staticRxKey, ciphertext=data)
-  if plaintext.isNone:
+  let signedPlaintext = secretboxOpen(key=self.staticRxKey, ciphertext=data)
+  if signedPlaintext.isNone:
     return
+
+  let plaintext = ed25519Unsign(data=signedPlaintext.get, purpose="cg-handshake", key=self.peerPublic)
 
   let handshake: Handshake = binaryUnpack(plaintext.get, Handshake)
 
@@ -107,7 +109,7 @@ proc inputHandler(self: Tunnel) {.async.} =
     elif kind == 1: # data
       await self.receivedDataPacket(data.slice(1))
 
-proc createTunnel*(raw: Pipe[Buffer], myKey: C25519Private, peerKey: C25519Public, psk: string=""): Tunnel =
+proc createTunnel*(raw: Pipe[Buffer], myKey: Ed25519Private, peerKey: Ed25519Public, psk: string=""): Tunnel =
   ## Creates a secure tunnel on ``raw`` pipe.
   ##
   ## It does not check for replay of individual packets - this should be a job of the upper layer.
@@ -116,14 +118,14 @@ proc createTunnel*(raw: Pipe[Buffer], myKey: C25519Private, peerKey: C25519Publi
   self.myKey = myKey
   self.peerPublic = peerKey
   self.ready = newCompleter[void]()
-  self.psk = sha256(psk)
+  self.psk = sha256("channelguard|" & psk)
   self.myEphemeral = c25519Generate()
   self.token = urandom(32).byteArray(32)
 
   (self.input, self.myInput) = newInputOutputPair[Buffer]()
   (self.myOutput, self.output) = newInputOutputPair[Buffer]()
 
-  (self.staticRxKey, self.staticTxKey) = dhKeyExchange(myKey, peerKey)
+  (self.staticRxKey, self.staticTxKey) = dhKeyExchange(myKey.edToC25519, peerKey.edToC25519)
   self.outputHandler().ignore
   self.inputHandler().ignore
 

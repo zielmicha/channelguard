@@ -10,4 +10,4 @@ skipDirs = @["tests"]
 
 requires "nim >= 0.18.0"
 requires "reactor >= 0.4.6"
-requires "sodium >= 0.1.0"
+requires "sodium >= 0.2.0"
