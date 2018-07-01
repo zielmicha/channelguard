@@ -75,8 +75,13 @@ proc receivedHandshake(self: Tunnel, data: Buffer) {.async.} =
     return
 
   let plaintext = ed25519Unsign(data=signedPlaintext.get, purpose="cg-handshake", key=self.peerPublic)
+  if plaintext.isNone: return
 
-  let handshake: Handshake = binaryUnpack(plaintext.get, Handshake)
+  var handshake: Handshake
+  try:
+    handshake = binaryUnpack(plaintext.get, Handshake)
+  except EOFError:
+    return
 
   if handshake.kind == 1 or handshake.kind == 2:
     if handshake.token2 != self.token: return
