@@ -1,4 +1,4 @@
-import sodium/c25519, sodium/secretbox, sodium/hmac, sodium/sha2, collections, reactor, collections/binary_pack
+import sodium/c25519, sodium/secretbox, sodium/sha2, collections, reactor, collections/binary_pack
 
 type
   Handshake* = object
@@ -7,12 +7,14 @@ type
     token1*: array[32, byte]
     token2*: array[32, byte]
 
+  Ed25519PublicHash* = array[16, byte]
+
   Tunnel* = ref object of Pipe[Buffer]
     raw: Pipe[Buffer]
     myInput: Output[Buffer]
     myOutput: Input[Buffer]
 
-    peerPublic: Ed25519Public
+    peerPublicHash: Ed25519PublicHash
     myKey: Ed25519Private
     psk: Sha256Hash
 
@@ -29,14 +31,20 @@ type
 
     token: array[32, byte]
 
+
+proc pubkeyHash*(data: Ed25519Public): Ed25519PublicHash =
+  let r = sha512d(data.toBinaryString)
+  for i in 0..<16: result[i] = r[i]
+
 proc isReady(self: Tunnel): bool =
   return self.ready.getFuture.isCompleted
 
 proc sendHandshake(self: Tunnel, h: Handshake) {.async.} =
   let data = ed25519Sign(data=binaryPack(h), key=self.myKey, purpose="cg-handshake")
-  let encrypted = newBuffer(1 + secretboxLength + data.len)
+  let encrypted = newBuffer(1 + 32 + secretboxLength + data.len)
   encrypted[0] = 0
-  secretboxMake(key=self.staticTxKey, plaintext=data, target=encrypted.slice(1))
+  encrypted.slice(1).copyFrom(self.myKey.getPublic.toBinaryString.newView)
+  secretboxMake(key=self.staticTxKey, plaintext=data, target=encrypted.slice(1 + 32))
   await self.raw.output.send(encrypted)
 
 proc sendHandshake(self: Tunnel) {.async.} =
@@ -70,11 +78,18 @@ proc finishExchange(self: Tunnel, peerEphemeral: C25519Public) =
   self.ready.complete
 
 proc receivedHandshake(self: Tunnel, data: Buffer) {.async.} =
-  let signedPlaintext = secretboxOpen(key=self.staticRxKey, ciphertext=data)
+  let peerPublic = data.slice(0, 32).copyAsString.byteArray(32)
+
+  if pubkeyHash(peerPublic) != self.peerPublicHash:
+    return
+
+  (self.staticRxKey, self.staticTxKey) = dhKeyExchange(self.myKey.edToC25519, peerPublic.edToC25519)
+
+  let signedPlaintext = secretboxOpen(key=self.staticRxKey, ciphertext=data.slice(32))
   if signedPlaintext.isNone:
     return
 
-  let plaintext = ed25519Unsign(data=signedPlaintext.get, purpose="cg-handshake", key=self.peerPublic)
+  let plaintext = ed25519Unsign(data=signedPlaintext.get, purpose="cg-handshake", key=peerPublic)
   if plaintext.isNone: return
 
   var handshake: Handshake
@@ -114,14 +129,14 @@ proc inputHandler(self: Tunnel) {.async.} =
     elif kind == 1: # data
       await self.receivedDataPacket(data.slice(1))
 
-proc createTunnel*(raw: Pipe[Buffer], myKey: Ed25519Private, peerKey: Ed25519Public, psk: string=""): Tunnel =
+proc createTunnel*(raw: Pipe[Buffer], myKey: Ed25519Private, peerKey: Ed25519PublicHash, psk: string=""): Tunnel =
   ## Creates a secure tunnel on ``raw`` pipe.
   ##
   ## It does not check for replay of individual packets - this should be a job of the upper layer.
   let self = Tunnel()
   self.raw = raw
   self.myKey = myKey
-  self.peerPublic = peerKey
+  self.peerPublicHash = peerKey
   self.ready = newCompleter[void]()
   self.psk = sha256("channelguard|" & psk)
   self.myEphemeral = c25519Generate()
@@ -130,7 +145,6 @@ proc createTunnel*(raw: Pipe[Buffer], myKey: Ed25519Private, peerKey: Ed25519Pub
   (self.input, self.myInput) = newInputOutputPair[Buffer]()
   (self.myOutput, self.output) = newInputOutputPair[Buffer]()
 
-  (self.staticRxKey, self.staticTxKey) = dhKeyExchange(myKey.edToC25519, peerKey.edToC25519)
   self.outputHandler().ignore
   self.inputHandler().ignore
 

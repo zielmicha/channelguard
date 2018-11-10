@@ -5,8 +5,8 @@ proc main() {.async.} =
   let keyA = ed25519Generate()
   let keyB = ed25519Generate()
   pipe1.packetLoss = 1.0 # lose first handshake (to test resend)
-  let a = createTunnel(rawA, keyA, keyB.getPublic)
-  let b = createTunnel(rawB, keyB, keyA.getPublic)
+  let a = createTunnel(rawA, keyA, pubkeyHash(keyB.getPublic))
+  let b = createTunnel(rawB, keyB, pubkeyHash(keyA.getPublic))
 
   await a.output.send(newView("foo"))
 
